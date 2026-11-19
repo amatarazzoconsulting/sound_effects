@@ -3,16 +3,24 @@
     PROFESSIONAL REAL-TIME SOUND PRODUCTION ENGINE
     ============================================================================
     Features:
-    - 128+ simultaneous sound voices
-    - Complete sound library (50+ sounds)
+    - 128 simultaneous sound voices
+    - Layered synthesis and categorized sound library
     - Real-time parameter modulation
-    - 3D spatialization with Doppler effect
+    - Stereo panning and distance attenuation
     - Built-in effects: Echo, Reverb, Chorus, Flanger, Stereo Pong
     - Priority-based voice stealing
     - Natural language descriptor parser
     ============================================================================
 */
 
+#include <array>
+#include <fstream>
+#include <filesystem>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <sstream>
+#include <cctype>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -41,6 +49,7 @@ constexpr double MASTER_VOLUME = 0.8;
 // Utilities
 // ============================================================================
 double clamp(double val, double min, double max) {
+    if (!std::isfinite(val)) throw std::invalid_argument("Non-finite parameter");
     return std::max(min, std::min(val, max));
 }
 
@@ -62,7 +71,7 @@ float fastSin(float x) {
 class Random {
 public:
     static Random& get() {
-        static Random instance;
+        static thread_local Random instance;
         return instance;
     }
     
@@ -92,24 +101,26 @@ public:
     
     void setType(Waveform type) { m_type = type; }
     
-    double render(double freq_hz) {
-        double increment = freq_hz / SAMPLE_RATE;
+    double render(double freq_hz, double duty = 0.5, double phaseMod = 0.0) {
+        double increment = clamp(freq_hz, 0.0, SAMPLE_RATE * 0.45) / SAMPLE_RATE;
         m_phase += increment;
-        if (m_phase >= 1.0) m_phase -= 1.0;
+        m_phase -= std::floor(m_phase);
         
         double sample = 0.0;
         switch (m_type) {
             case Waveform::SINE:
-                sample = sin(2.0 * PI * m_phase);
+                sample = sin(2.0 * PI * m_phase + phaseMod);
                 break;
             case Waveform::SQUARE:
-                sample = m_phase < 0.5 ? 1.0 : -1.0;
+                duty = clamp(duty, 0.05, 0.95);
+                sample = (m_phase < duty ? 1.0 : -1.0) + polyBlep(m_phase, increment)
+                       - polyBlep(std::fmod(m_phase - duty + 1.0, 1.0), increment);
                 break;
             case Waveform::TRIANGLE:
                 sample = 2.0 * fabs(2.0 * m_phase - 1.0) - 1.0;
                 break;
             case Waveform::SAWTOOTH:
-                sample = 2.0 * m_phase - 1.0;
+                sample = 2.0 * m_phase - 1.0 - polyBlep(m_phase, increment);
                 break;
             case Waveform::NOISE:
                 sample = Random::get().uniform(-1.0, 1.0);
@@ -118,7 +129,9 @@ public:
                 sample = sin(2.0 * PI * m_phase) * 0.7 + Random::get().uniform(-0.3, 0.3);
                 break;
             case Waveform::METALLIC:
-                sample = sin(2.0 * PI * m_phase) + 0.5 * sin(2.0 * PI * m_phase * 2.17);
+                m_partialPhase += increment * 2.17;
+                m_partialPhase -= std::floor(m_partialPhase);
+                sample = sin(2.0 * PI * m_phase) + 0.5 * sin(2.0 * PI * m_partialPhase);
                 break;
         }
         return sample;
@@ -127,6 +140,13 @@ public:
 private:
     Waveform m_type;
     double m_phase;
+    double m_partialPhase = 0.0;
+    static double polyBlep(double phase, double increment) {
+        if (increment <= 0) return 0;
+        if (phase < increment) { double t = phase / increment; return 2*t - t*t - 1; }
+        if (phase > 1 - increment) { double t = (phase - 1) / increment; return t*t + 2*t + 1; }
+        return 0;
+    }
 };
 
 // ============================================================================
@@ -140,10 +160,11 @@ struct Envelope {
     
     double compute(double time_ms, double duration_ms, bool releasing = false) {
         if (releasing) {
-            double release_start = duration_ms - release_ms;
+            double release_start = duration_ms;
+            if (release_ms <= 0) return 0.0;
             if (time_ms < release_start) return sustain;
             double t = clamp((time_ms - release_start) / release_ms, 0.0, 1.0);
-            return sustain * (1.0 - t);
+            return compute(duration_ms, duration_ms, false) * (1.0 - t);
         } else {
             if (time_ms < attack_ms) return clamp(time_ms / attack_ms, 0.0, 1.0);
             if (time_ms < attack_ms + decay_ms) {
@@ -160,15 +181,18 @@ struct Envelope {
 // ============================================================================
 class DelayLine {
 public:
-    DelayLine(int max_samples) : m_buffer(max_samples, 0.0), m_pos(0) {}
+    DelayLine(int max_samples) : m_buffer(std::max(1, max_samples), 0.0), m_pos(0) {}
     
+    int maxSize() const { return static_cast<int>(m_buffer.size()); }
+
     void write(double sample) {
         m_buffer[m_pos] = sample;
         m_pos = (m_pos + 1) % m_buffer.size();
     }
     
     double read(int delay_samples) {
-        int pos = (m_pos - delay_samples + m_buffer.size()) % m_buffer.size();
+        delay_samples = std::max(1, std::min(delay_samples, maxSize()));
+        int pos = (m_pos - delay_samples + maxSize()) % maxSize();
         return m_buffer[pos];
     }
     
@@ -180,7 +204,7 @@ private:
 class Echo {
 public:
     Echo(double delay_sec = 0.3, double decay = 0.5) 
-        : m_delayLine(SAMPLE_RATE * 2), m_delaySamples(SAMPLE_RATE * delay_sec), m_decay(decay) {}
+        : m_delayLine(SAMPLE_RATE * 2), m_delaySamples(static_cast<int>(SAMPLE_RATE * clamp(delay_sec, 1.0 / SAMPLE_RATE, 2.0))), m_decay(clamp(decay, 0.0, 0.99)) {}
     
     double process(double sample) {
         double delayed = m_delayLine.read(m_delaySamples);
@@ -198,8 +222,8 @@ private:
 class Reverb {
 public:
     Reverb(double room_size = 0.5, double damping = 0.5) 
-        : m_delayLines{SAMPLE_RATE * 0.0297, SAMPLE_RATE * 0.0371, SAMPLE_RATE * 0.0411, SAMPLE_RATE * 0.0437},
-          m_feedback(room_size * 0.8), m_damping(damping) {}
+        : m_delayLines{DelayLine(1426), DelayLine(1781), DelayLine(1973), DelayLine(2098)},
+          m_feedback(clamp(room_size, 0.0, 1.0) * 0.8), m_damping(clamp(damping, 0.0, 1.0)) {}
     
     double process(double sample) {
         double wet = 0.0;
@@ -220,11 +244,11 @@ private:
 class Chorus {
 public:
     Chorus(double rate = 0.5, double depth = 0.003, double mix = 0.5)
-        : m_rate(rate), m_depth(depth * SAMPLE_RATE), m_mix(mix), m_phase(0.0) {}
+        : m_rate(clamp(rate, 0.0, 100.0)), m_depth(clamp(depth, 0.0, 0.1) * SAMPLE_RATE), m_mix(clamp(mix, 0.0, 1.0)), m_phase(0.0) {}
     
     double process(double sample) {
         m_phase += m_rate / SAMPLE_RATE;
-        if (m_phase >= 1.0) m_phase -= 1.0;
+        m_phase -= std::floor(m_phase);
         
         double lfo = sin(2.0 * PI * m_phase);
         int delay_samples = (int)(m_depth * (0.5 + lfo * 0.5));
@@ -243,11 +267,11 @@ private:
 class Flanger {
 public:
     Flanger(double rate = 0.25, double depth = 0.005, double feedback = 0.7, double mix = 0.5)
-        : m_rate(rate), m_depth(depth * SAMPLE_RATE), m_feedback(feedback), m_mix(mix), m_phase(0.0) {}
+        : m_rate(clamp(rate, 0.0, 100.0)), m_depth(clamp(depth, 0.0, 0.05) * SAMPLE_RATE), m_feedback(clamp(feedback, -0.99, 0.99)), m_mix(clamp(mix, 0.0, 1.0)), m_phase(0.0) {}
     
     double process(double sample) {
         m_phase += m_rate / SAMPLE_RATE;
-        if (m_phase >= 1.0) m_phase -= 1.0;
+        m_phase -= std::floor(m_phase);
         
         double lfo = sin(2.0 * PI * m_phase);
         int delay_samples = (int)(m_depth * (0.5 + lfo * 0.5));
@@ -266,21 +290,17 @@ private:
 class StereoPong {
 public:
     StereoPong(double delay_sec = 0.25, double decay = 0.6) 
-        : m_delaySamples(SAMPLE_RATE * delay_sec), m_decay(decay), m_pan(1.0) {}
+        : m_delaySamples(static_cast<int>(SAMPLE_RATE * clamp(delay_sec, 1.0 / SAMPLE_RATE, 2.0))), m_decay(clamp(decay, 0.0, 0.99)) {}
     
     void process(double& left, double& right) {
         double left_delayed = m_leftDelay.read(m_delaySamples);
         double right_delayed = m_rightDelay.read(m_delaySamples);
         
-        // Ping-pong effect: bounces between left and right
-        m_pan *= -1.0;
-        
-        double output_left = left + (m_pan > 0 ? left_delayed : right_delayed) * m_decay;
-        double output_right = right + (m_pan < 0 ? left_delayed : right_delayed) * m_decay;
-        
-        m_leftDelay.write(left + right_delayed * m_decay * 0.5);
-        m_rightDelay.write(right + left_delayed * m_decay * 0.5);
-        
+        double output_left = left + right_delayed * m_decay;
+        double output_right = right + left_delayed * m_decay;
+        m_leftDelay.write(output_left);
+        m_rightDelay.write(output_right);
+
         left = output_left;
         right = output_right;
     }
@@ -290,8 +310,9 @@ private:
     DelayLine m_rightDelay{SAMPLE_RATE * 2};
     int m_delaySamples;
     double m_decay;
-    double m_pan;
 };
+
+#include "synthesis.h"
 
 // ============================================================================
 // Sound Voice (Active Sound Instance)
@@ -299,6 +320,8 @@ private:
 struct SoundVoice {
     // Core
     Oscillator oscillator;
+    Oscillator metal{Waveform::METALLIC};
+    std::vector<LayerVoice> layers;
     Envelope envelope;
     double frequency = 440.0;
     double amplitude = 0.5;
@@ -321,7 +344,7 @@ struct SoundVoice {
     
     // State
     double elapsed_ms = 0.0;
-    bool active = true;
+    bool active = false;
     bool releasing = false;
     int priority = 5;
     
@@ -348,17 +371,18 @@ struct SoundVoice {
         }
         double final_freq = frequency * pow(2.0, pitch_mod / 12.0) * doppler_shift;
         
-        // Generate base sample
-        double sample = oscillator.render(final_freq);
+        // Independent layers share only the outer voice envelope and spatial controls.
+        double sample = 0.0;
+        if (layers.empty()) sample = oscillator.render(final_freq);
+        else for (auto& layer : layers) sample += layer.render(elapsed_ms, final_freq);
         
         // Add noise texture
-        if (noise_amount > 0.0) {
+        if (layers.empty() && noise_amount > 0.0) {
             sample = sample * (1.0 - noise_amount) + Random::get().uniform(-1.0, 1.0) * noise_amount;
         }
         
         // Add metallic ringing
-        if (metallic_amount > 0.0) {
-            Oscillator metal(Waveform::METALLIC);
+        if (layers.empty() && metallic_amount > 0.0) {
             sample += metal.render(final_freq * 2.17) * metallic_amount;
         }
         
@@ -408,30 +432,36 @@ struct SoundDefinition {
     double noise_amount = 0.0;
     double metallic_amount = 0.0;
     int priority = 5;
+    std::vector<SynthLayer> layers{};
+    std::string category = "classic";
 };
 
 // ============================================================================
-// Sound Library (50+ Sounds)
+// Sound Library
 // ============================================================================
 class SoundLibrary {
 public:
     SoundLibrary() {
         initializeSounds();
+        designPresets();
     }
     
     const SoundDefinition* findSound(const std::string& name) const {
         auto it = m_soundsByName.find(name);
         if (it != m_soundsByName.end()) return &it->second;
         
-        // Keyword matching
-        for (const auto& [key, sound] : m_soundsByName) {
+        // Whole-word matching in declaration order keeps aliases deterministic.
+        const SoundDefinition* best = nullptr;
+        size_t bestScore = 0;
+        for (const auto& sound : m_soundList) {
+            size_t score = 0;
             for (const auto& keyword : sound.keywords) {
-                if (name.find(keyword) != std::string::npos) {
-                    return &sound;
-                }
+                if ((" " + name + " ").find(" " + keyword + " ") != std::string::npos)
+                    score += keyword.size();
             }
+            if (score > bestScore) { bestScore = score; best = &sound; }
         }
-        return nullptr;
+        return best;
     }
     
     const std::vector<SoundDefinition>& getAllSounds() const { return m_soundList; }
@@ -544,7 +574,7 @@ private:
         addSound({"growl", {"growl", "animal"}, Waveform::SAWTOOTH, 120.0, 0.7, 800.0,
                   {30, 100, 0.6, 200}, 0.5, 0.8});
         
-        // ========== ADD MORE SOUNDS (50+ total) ==========
+        // ========== ADD MORE SOUNDS (42 total) ==========
         addSound({"whoosh", {"whoosh", "swoosh", "fly"}, Waveform::SINE_NOISE, 300.0, 0.5, 600.0,
                   {1, 150, 0.4, 100}, 2.0, 1.0});
         
@@ -579,6 +609,8 @@ private:
                   {1, 50, 0.4, 100}, 0.0, 0.0, 0.0, 0.0, 0.2, 0.5});
     }
     
+    #include "presets.h"
+
     std::vector<SoundDefinition> m_soundList;
     std::unordered_map<std::string, SoundDefinition> m_soundsByName;
 };
@@ -588,20 +620,26 @@ private:
 // ============================================================================
 class SoundEngine {
 public:
-    SoundEngine() : m_running(true), m_masterVolume(MASTER_VOLUME) {
-        m_audioThread = std::thread(&SoundEngine::audioThreadFunc, this);
-    }
-    
-    ~SoundEngine() {
-        m_running = false;
-        if (m_audioThread.joinable()) m_audioThread.join();
-    }
-    
+    SoundEngine() = default;
+
     // Play a sound by name
-    void play(const std::string& soundName, double volume = 1.0, double pan = 0.0, double distance = 1.0) {
+    void play(const std::string& soundName, double volume = 1.0, double pan = 0.0, double distance = 1.0, double pitchShift = 1.0) {
+        volume = clamp(volume, 0.0, 1.0);
+        pan = clamp(pan, -1.0, 1.0);
+        distance = clamp(distance, 0.0, 1e6);
+        pitchShift = clamp(pitchShift, 0.01, 100.0);
         const SoundDefinition* def = m_library.findSound(soundName);
         if (!def) return;
-        
+        play(*def, volume, pan, distance, pitchShift);
+    }
+
+    // Caller-defined layers can be used without modifying the built-in library.
+    void play(const SoundDefinition& definition, double volume = 1.0, double pan = 0.0,
+              double distance = 1.0, double pitchShift = 1.0) {
+        const auto* def = &definition;
+        volume = clamp(volume, 0.0, 1.0); pan = clamp(pan, -1.0, 1.0);
+        distance = clamp(distance, 0.0, 1e6); pitchShift = clamp(pitchShift, .01, 100.0);
+        validateDefinition(definition);
         std::lock_guard<std::mutex> lock(m_voiceMutex);
         
         // Find free voice or lowest priority voice to steal
@@ -621,12 +659,15 @@ public:
         }
         
         int targetIndex = (freeIndex != -1) ? freeIndex : lowestIndex;
-        if (targetIndex == -1) return;
+        if (targetIndex == -1 || (freeIndex == -1 && def->priority < lowestPriority)) return;
         
         // Initialize voice
         SoundVoice& voice = m_voices[targetIndex];
+        voice = SoundVoice{};
         voice.oscillator.setType(def->waveform);
-        voice.frequency = def->base_freq;
+        for (size_t i = 0; i < def->layers.size(); ++i)
+            voice.layers.emplace_back(def->layers[i], static_cast<std::uint32_t>(i + 1));
+        voice.frequency = def->base_freq * pitchShift;
         voice.amplitude = def->amplitude * volume;
         voice.duration_ms = def->duration_ms;
         voice.envelope = def->envelope;
@@ -646,150 +687,110 @@ public:
     
     // Play with natural language description
     void playNatural(const std::string& description, double volume = 1.0) {
-        // Parse description for modifiers
-        double pitch_shift = 1.0;
-        double pan = 0.0;
-        std::string soundType = description;
-        
-        if (description.find("left") != std::string::npos) pan = -0.8;
-        if (description.find("right") != std::string::npos) pan = 0.8;
-        if (description.find("high") != std::string::npos) pitch_shift = 1.5;
-        if (description.find("low") != std::string::npos) pitch_shift = 0.7;
-        if (description.find("fast") != std::string::npos) pitch_shift = 1.3;
-        if (description.find("slow") != std::string::npos) pitch_shift = 0.8;
-        
-        play(soundType, volume, pan);
-        
-        // Apply pitch shift by modifying frequency (simplified)
-        std::lock_guard<std::mutex> lock(m_voiceMutex);
-        for (auto& voice : m_voices) {
-            if (voice.active) {
-                voice.frequency *= pitch_shift;
-            }
+        double pitch = 1.0, pan = 0.0;
+        std::istringstream input(description);
+        std::string word, sound;
+        while (input >> word) {
+            std::transform(word.begin(), word.end(), word.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (word == "left") pan = -0.8;
+            else if (word == "right") pan = 0.8;
+            else if (word == "high") pitch = 1.5;
+            else if (word == "low") pitch = 0.7;
+            else if (word == "fast") pitch = 1.3;
+            else if (word == "slow") pitch = 0.8;
+            else { if (!sound.empty()) sound += ' '; sound += word; }
         }
+        play(sound, volume, pan, 1.0, pitch);
     }
-    
+
     // Set global effect parameters
     void setEcho(double delay_sec, double decay) {
+        std::array<std::unique_ptr<Echo>, 2> effects{std::make_unique<Echo>(delay_sec, decay), std::make_unique<Echo>(delay_sec, decay)};
+        std::lock_guard<std::mutex> lock(m_voiceMutex);
+        m_echo = std::move(effects);
         m_echoEnabled = true;
-        m_echo = std::make_unique<Echo>(delay_sec, decay);
     }
     
     void setReverb(double room_size, double damping) {
+        std::array<std::unique_ptr<Reverb>, 2> effects{std::make_unique<Reverb>(room_size, damping), std::make_unique<Reverb>(room_size, damping)};
+        std::lock_guard<std::mutex> lock(m_voiceMutex);
+        m_reverb = std::move(effects);
         m_reverbEnabled = true;
-        m_reverb = std::make_unique<Reverb>(room_size, damping);
     }
     
     void setChorus(double rate, double depth, double mix) {
+        std::array<std::unique_ptr<Chorus>, 2> effects{std::make_unique<Chorus>(rate, depth, mix), std::make_unique<Chorus>(rate, depth, mix)};
+        std::lock_guard<std::mutex> lock(m_voiceMutex);
+        m_chorus = std::move(effects);
         m_chorusEnabled = true;
-        m_chorus = std::make_unique<Chorus>(rate, depth, mix);
     }
     
     void setFlanger(double rate, double depth, double feedback, double mix) {
+        std::array<std::unique_ptr<Flanger>, 2> effects{std::make_unique<Flanger>(rate, depth, feedback, mix), std::make_unique<Flanger>(rate, depth, feedback, mix)};
+        std::lock_guard<std::mutex> lock(m_voiceMutex);
+        m_flanger = std::move(effects);
         m_flangerEnabled = true;
-        m_flanger = std::make_unique<Flanger>(rate, depth, feedback, mix);
     }
     
     void setStereoPong(double delay_sec, double decay) {
+        auto effect = std::make_unique<StereoPong>(delay_sec, decay);
+        std::lock_guard<std::mutex> lock(m_voiceMutex);
         m_pongEnabled = true;
-        m_pong = std::make_unique<StereoPong>(delay_sec, decay);
+        m_pong = std::move(effect);
     }
     
-    void disableEcho() { m_echoEnabled = false; }
-    void disableReverb() { m_reverbEnabled = false; }
-    void disableChorus() { m_chorusEnabled = false; }
-    void disableFlanger() { m_flangerEnabled = false; }
-    void disableStereoPong() { m_pongEnabled = false; }
+    void disableEcho() { std::lock_guard<std::mutex> lock(m_voiceMutex); m_echoEnabled = false; }
+    void disableReverb() { std::lock_guard<std::mutex> lock(m_voiceMutex); m_reverbEnabled = false; }
+    void disableChorus() { std::lock_guard<std::mutex> lock(m_voiceMutex); m_chorusEnabled = false; }
+    void disableFlanger() { std::lock_guard<std::mutex> lock(m_voiceMutex); m_flangerEnabled = false; }
+    void disableStereoPong() { std::lock_guard<std::mutex> lock(m_voiceMutex); m_pongEnabled = false; }
     
-    void setMasterVolume(double vol) { m_masterVolume = clamp(vol, 0.0, 1.0); }
+    void setMasterVolume(double vol) { std::lock_guard<std::mutex> lock(m_voiceMutex); m_masterVolume = clamp(vol, 0.0, 1.0); }
     
     // Get audio buffer (call this regularly for output)
     void getAudioBuffer(float* output, int numSamples, int channels = 2) {
-        std::fill(output, output + numSamples * channels, 0.0f);
-        
-        double delta_ms = (double)numSamples / SAMPLE_RATE * 1000.0;
-        
+        if (numSamples < 0 || (channels != 1 && channels != 2) || (!output && numSamples > 0))
+            throw std::invalid_argument("Expected valid output, nonnegative frames, and 1 or 2 channels");
         std::lock_guard<std::mutex> lock(m_voiceMutex);
-        
-        // Process all active voices
-        for (auto& voice : m_voices) {
-            if (!voice.active) continue;
-            
-            for (int i = 0; i < numSamples; i++) {
-                double left = 0.0, right = 0.0;
+        for (int i = 0; i < numSamples; ++i) {
+            double left = 0.0, right = 0.0;
+            for (auto& voice : m_voices) {
+                if (!voice.active) continue;
                 voice.render(left, right);
-                
-                int idx = i * channels;
-                output[idx] += (float)left;
-                if (channels > 1) output[idx + 1] += (float)right;
+                voice.update(1000.0 / SAMPLE_RATE);
             }
-            voice.update(delta_ms);
-        }
-        
-        // Apply effects
-        if (m_echoEnabled && m_echo) {
-            for (int i = 0; i < numSamples * channels; i += channels) {
-                double sample = output[i];
-                sample = m_echo->process(sample);
-                output[i] = (float)sample;
-                if (channels > 1) output[i + 1] = (float)sample;
-            }
-        }
-        
-        if (m_reverbEnabled && m_reverb) {
-            for (int i = 0; i < numSamples * channels; i += channels) {
-                double sample = output[i];
-                sample = m_reverb->process(sample);
-                output[i] = (float)sample;
-                if (channels > 1) output[i + 1] = (float)sample;
-            }
-        }
-        
-        if (m_chorusEnabled && m_chorus) {
-            for (int i = 0; i < numSamples * channels; i++) {
-                output[i] = (float)m_chorus->process(output[i]);
-            }
-        }
-        
-        if (m_flangerEnabled && m_flanger) {
-            for (int i = 0; i < numSamples * channels; i++) {
-                output[i] = (float)m_flanger->process(output[i]);
-            }
-        }
-        
-        if (m_pongEnabled && m_pong) {
-            for (int i = 0; i < numSamples; i++) {
-                double left = output[i * channels];
-                double right = (channels > 1) ? output[i * channels + 1] : left;
-                m_pong->process(left, right);
-                output[i * channels] = (float)left;
-                if (channels > 1) output[i * channels + 1] = (float)right;
-            }
-        }
-        
-        // Apply master volume and clamp
-        for (int i = 0; i < numSamples * channels; i++) {
-            output[i] = clamp(output[i] * (float)m_masterVolume, -1.0f, 1.0f);
+            if (m_echoEnabled) { left = m_echo[0]->process(left); right = m_echo[1]->process(right); }
+            if (m_reverbEnabled) { left = m_reverb[0]->process(left); right = m_reverb[1]->process(right); }
+            if (m_chorusEnabled) { left = m_chorus[0]->process(left); right = m_chorus[1]->process(right); }
+            if (m_flangerEnabled) { left = m_flanger[0]->process(left); right = m_flanger[1]->process(right); }
+            if (m_pongEnabled) m_pong->process(left, right);
+            const size_t idx = static_cast<size_t>(i) * channels;
+            output[idx] = static_cast<float>(clamp((channels == 1 ? (left + right) * 0.5 : left) * m_masterVolume, -1.0, 1.0));
+            if (channels == 2) output[idx + 1] = static_cast<float>(clamp(right * m_masterVolume, -1.0, 1.0));
         }
     }
-    
+
 private:
-    void audioThreadFunc() {
-        // In a real implementation, this would feed audio to the system
-        // For this example, we just simulate
-        std::vector<float> buffer(BUFFER_SIZE * 2);
-        while (m_running) {
-            getAudioBuffer(buffer.data(), BUFFER_SIZE, 2);
-            std::this_thread::sleep_for(std::chrono::milliseconds(BUFFER_SIZE * 1000 / SAMPLE_RATE));
-        }
+    static void validateDefinition(const SoundDefinition& d) {
+        auto range = [](double value, double low, double high) {
+            if (!std::isfinite(value) || value < low || value > high)
+                throw std::invalid_argument("Invalid custom synthesis parameter");
+        };
+        range(d.priority, 0, 10);
+        range(d.base_freq, 0, 20000); range(d.amplitude, 0, 1); range(d.duration_ms, 0, 600000);
+        range(d.envelope.attack_ms, 0, 600000); range(d.envelope.decay_ms, 0, 600000);
+        range(d.envelope.sustain, 0, 1); range(d.envelope.release_ms, 0, 600000);
+        range(d.pitch_lfo_rate, 0, 1000); range(d.pitch_lfo_depth, 0, 96);
+        range(d.amplitude_lfo_rate, 0, 1000); range(d.amplitude_lfo_depth, 0, 1);
+        range(d.noise_amount, 0, 1); range(d.metallic_amount, 0, 1);
+        if (d.layers.size() > 8) throw std::invalid_argument("At most eight synthesis layers");
+        for (const auto& layer : d.layers) layer.validate();
     }
-    
     SoundLibrary m_library;
     std::array<SoundVoice, MAX_VOICES> m_voices;
     std::mutex m_voiceMutex;
-    std::thread m_audioThread;
-    std::atomic<bool> m_running;
-    double m_masterVolume;
+    double m_masterVolume = MASTER_VOLUME;
     
     // Effects
     bool m_echoEnabled = false;
@@ -798,76 +799,151 @@ private:
     bool m_flangerEnabled = false;
     bool m_pongEnabled = false;
     
-    std::unique_ptr<Echo> m_echo;
-    std::unique_ptr<Reverb> m_reverb;
-    std::unique_ptr<Chorus> m_chorus;
-    std::unique_ptr<Flanger> m_flanger;
+    std::array<std::unique_ptr<Echo>, 2> m_echo;
+    std::array<std::unique_ptr<Reverb>, 2> m_reverb;
+    std::array<std::unique_ptr<Chorus>, 2> m_chorus;
+    std::array<std::unique_ptr<Flanger>, 2> m_flanger;
     std::unique_ptr<StereoPong> m_pong;
 };
 
 // ============================================================================
 // Demonstration
 // ============================================================================
-int main() {
-    std::cout << "========================================\n";
-    std::cout << "PROFESSIONAL REAL-TIME SOUND ENGINE\n";
-    std::cout << "========================================\n\n";
-    
-    SoundEngine engine;
-    
-    // Enable effects for rich sound
-    engine.setReverb(0.6, 0.4);
-    engine.setStereoPong(0.25, 0.5);
-    engine.setMasterVolume(0.7);
-    
-    std::cout << "Playing demonstration sounds...\n\n";
-    
-    // Play a sequence of sounds
-    std::vector<std::pair<std::string, double>> demoSequence = {
-        {"ding", 0.8},
-        {"magic_sparkle", 0.6},
-        {"laser", 0.7},
-        {"explosion", 0.9},
-        {"cartoon_crash", 0.8},
-        {"cha_ching", 0.7},
-        {"powerup", 0.8},
-        {"roar", 0.7},
-        {"product_reveal", 0.7},
-        {"applause", 0.6}
-    };
-    
-    for (const auto& [sound, volume] : demoSequence) {
-        std::cout << " > " << sound << "\n";
-        engine.play(sound, volume);
-        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+#ifndef SOUND_ENGINE_NO_MAIN
+// Raw PCM: signed 16-bit little-endian, interleaved stereo, 48 kHz, no header.
+int main(int argc, char** argv) {
+    try {
+        std::string path = "demo.pcm", wavPath, sound, category;
+        bool rawRequested = false, all = false, list = false, effects = false;
+        double seconds = 3.0;
+        for (int i = 1; i < argc; ++i) {
+            std::string option = argv[i];
+            if (option == "--help") {
+                std::cout << "Usage: sound_effects [--output PCM_FILE] [--wav-output WAV_FILE] [--all | --category NAME | --sound NAME_OR_DESCRIPTION] [--list] [--effects] [--seconds 0.001..600]\n"
+                          << "Default: demo sequence to demo.pcm. Format: s16le, 48000 Hz, stereo.\n";
+                return 0;
+            }
+            if (option == "--list") { list = true; continue; }
+            if (option == "--effects") { effects = true; continue; }
+            if (option == "--all") { all = true; continue; }
+            if (i + 1 >= argc) throw std::invalid_argument("Missing value for " + option);
+            std::string value = argv[++i];
+            if (option == "--output") { path = value; rawRequested = true; }
+            else if (option == "--wav-output") {
+                if (value.empty()) throw std::invalid_argument("Empty WAV output path");
+                wavPath = value;
+            }
+            else if (option == "--sound") sound = value;
+            else if (option == "--category") { category = value; all = true; }
+            else if (option == "--seconds") {
+                size_t used = 0;
+                seconds = std::stod(value, &used);
+                if (used != value.size() || !std::isfinite(seconds) || seconds < .001 || seconds > 600)
+                    throw std::invalid_argument("Seconds must be in 0.001..600");
+            } else throw std::invalid_argument("Unknown option: " + option);
+        }
+        if (all && !sound.empty()) throw std::invalid_argument("Use --all or --sound, not both");
+        SoundLibrary library;
+        if (list) {
+            for (const auto& preset : library.getAllSounds())
+                if (category.empty() || preset.category == category)
+                    std::cout << preset.name << "\t" << preset.category << "\n";
+            return 0;
+        }
+        // Validate natural descriptions using the same modifier rules as playNatural.
+        if (!sound.empty()) {
+            std::istringstream words(sound);
+            std::string word, lookup;
+            while (words >> word) {
+                std::transform(word.begin(), word.end(), word.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (word != "high" && word != "low" && word != "fast" && word != "slow" && word != "left" && word != "right") {
+                    if (!lookup.empty()) lookup += ' ';
+                    lookup += word;
+                }
+            }
+            if (!library.findSound(lookup)) throw std::invalid_argument("Unknown sound: " + sound);
+        }
+        SoundEngine engine;
+        if (effects) { engine.setReverb(.6, .25); engine.setStereoPong(.25, .25); }
+        std::vector<std::string> sequence = sound.empty()
+            ? std::vector<std::string>{"ding", "magic_sparkle", "laser", "explosion", "cartoon_crash", "cha_ching", "powerup", "roar", "product_reveal", "applause"}
+            : std::vector<std::string>{sound};
+        if (all) {
+            sequence.clear();
+            for (const auto& preset : library.getAllSounds())
+                if (category.empty() || preset.category == category) sequence.push_back(preset.name);
+            if (sequence.empty()) throw std::invalid_argument("Unknown or empty preset category");
+        }
+        std::vector<int> frameCounts;
+        std::uint64_t totalFrames = 0;
+        for (const auto& description : sequence) {
+            double length = seconds;
+            if (all) {
+                const auto* preset = library.findSound(description);
+                length = std::max(length, (preset->duration_ms + preset->envelope.release_ms) / 1000.0 + .5);
+            }
+            int frames = static_cast<int>(std::llround(length * SAMPLE_RATE));
+            frameCounts.push_back(frames);
+            totalFrames += frames;
+        }
+        const std::uint64_t dataBytes = totalFrames * 4;
+        if (!wavPath.empty() && dataBytes > std::numeric_limits<std::uint32_t>::max() - 36ULL)
+            throw std::invalid_argument("Output exceeds RIFF WAV size limit");
+        const bool writeRaw = rawRequested || wavPath.empty();
+        if (writeRaw && !wavPath.empty() &&
+            std::filesystem::weakly_canonical(path) == std::filesystem::weakly_canonical(wavPath))
+            throw std::invalid_argument("PCM and WAV output paths must differ");
+        std::ofstream output, wav;
+        if (writeRaw) {
+            output.open(path, std::ios::binary | std::ios::trunc);
+            if (!output) throw std::runtime_error("Cannot open output: " + path);
+        }
+        if (!wavPath.empty()) {
+            wav.open(wavPath, std::ios::binary | std::ios::trunc);
+            if (!wav) throw std::runtime_error("Cannot open WAV output: " + wavPath);
+            auto little = [&](std::uint32_t value, int bytes) {
+                for (int n = 0; n < bytes; ++n) wav.put(static_cast<char>((value >> (8 * n)) & 255));
+            };
+            wav.write("RIFF", 4); little(static_cast<std::uint32_t>(36 + dataBytes), 4);
+            wav.write("WAVEfmt ", 8); little(16, 4); little(1, 2); little(2, 2);
+            little(SAMPLE_RATE, 4); little(SAMPLE_RATE * 4, 4); little(4, 2); little(16, 2);
+            wav.write("data", 4); little(static_cast<std::uint32_t>(dataBytes), 4);
+        }
+        std::array<float, BUFFER_SIZE * 2> buffer{};
+        std::uint64_t startFrame = 0;
+        for (size_t track = 0; track < sequence.size(); ++track) {
+            const auto& description = sequence[track];
+            const int total = frameCounts[track];
+            std::cout << static_cast<double>(startFrame) / SAMPLE_RATE << "s " << description << '\n';
+            startFrame += total;
+            engine.playNatural(description, .7);
+            for (int frame = 0; frame < total;) {
+                int count = std::min(BUFFER_SIZE, total - frame);
+                engine.getAudioBuffer(buffer.data(), count);
+                for (int n = 0; n < count * 2; ++n) {
+                    int sample = static_cast<int>(std::lround(buffer[n] * 32767.0));
+                    auto bits = static_cast<std::uint16_t>(sample);
+                    const char bytes[2] = {static_cast<char>(bits & 255), static_cast<char>(bits >> 8)};
+                    if (writeRaw) output.write(bytes, 2);
+                    if (!wavPath.empty()) wav.write(bytes, 2);
+                }
+                frame += count;
+            }
+        }
+        if (writeRaw) {
+            output.close();
+            if (!output) throw std::runtime_error("Failed writing output: " + path);
+            std::cout << "Wrote " << path << " (s16le, 48000 Hz, stereo)\n";
+        }
+        if (!wavPath.empty()) {
+            wav.close();
+            if (!wav) throw std::runtime_error("Failed writing WAV output: " + wavPath);
+            std::cout << "Wrote " << wavPath << " (16-bit PCM WAV, 48000 Hz, stereo)\n";
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return 1;
     }
-    
-    // Demonstrate natural language
-    std::cout << "\n--- Natural Language Examples ---\n";
-    engine.playNatural("high laser left", 0.7);
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    engine.playNatural("low explosion right", 0.8);
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
-    
-    // Demonstrate effects changing
-    std::cout << "\n--- Changing Effects ---\n";
-    engine.setFlanger(0.3, 0.004, 0.6, 0.5);
-    engine.play("laser", 0.7);
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    engine.disableFlanger();
-    engine.setChorus(0.8, 0.002, 0.4);
-    engine.play("magic_sparkle", 0.7);
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    std::cout << "\nEngine running. Press Enter to exit...\n";
-    std::cin.get();
-    
-    return 0;
 }
-
-engine.play("laser", 0.8, 0.5);           // Play at center, volume 0.8
-engine.play("explosion", 1.0, -0.8);      // Play from left
-engine.playNatural("high metallic crash"); // Natural description
-engine.setReverb(0.7, 0.5);               // Add reverb
-engine.setStereoPong(0.3, 0.6);           // Add ping-pong delay
+#endif
